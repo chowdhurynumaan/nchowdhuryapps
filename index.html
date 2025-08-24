@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Notes App</title>
+    <!-- Inter font from Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        /* Custom styles to prevent printing non-essential elements */
+        @media print {
+            .no-print {
+                display: none !important;
+            }
+        }
+    </style>
+</head>
+<body class="p-8">
+
+    <!-- Main Container for the entire application -->
+    <div class="max-w-4xl mx-auto bg-white rounded-xl shadow-lg p-8 space-y-8">
+        <h1 class="text-3xl font-bold text-center text-gray-800">Meeting Notes</h1>
+
+        <!-- Meeting Details Section -->
+        <div class="space-y-4">
+            <h2 class="text-2xl font-semibold text-gray-700 border-b pb-2">Meeting Details</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label for="meeting-title" class="block text-sm font-medium text-gray-700">Meeting Title</label>
+                    <input type="text" id="meeting-title" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 transition duration-200 ease-in-out border" value="Weekly Team Sync">
+                </div>
+                <div>
+                    <label for="meeting-date" class="block text-sm font-medium text-gray-700">Date</label>
+                    <input type="date" id="meeting-date" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 transition duration-200 ease-in-out border" value="2023-10-27">
+                </div>
+                <div>
+                    <label for="attendees" class="block text-sm font-medium text-gray-700">Attendees (In-Person)</label>
+                    <input type="text" id="attendees" placeholder="E.g., John Doe, Jane Smith" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 transition duration-200 ease-in-out border" value="John, Sarah, Mike">
+                </div>
+                <div>
+                    <label for="dial-in-attendees" class="block text-sm font-medium text-gray-700">Dial-in Attendees</label>
+                    <input type="text" id="dial-in-attendees" placeholder="E.g., Alex Johnson" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 transition duration-200 ease-in-out border" value="Alex">
+                </div>
+            </div>
+        </div>
+
+        <!-- Dynamic Topics Section -->
+        <div class="space-y-4">
+            <h2 class="text-2xl font-semibold text-gray-700 border-b pb-2">Topics & Discussion</h2>
+            <div id="topics-container" class="space-y-6">
+                <!-- Topics will be added dynamically here -->
+            </div>
+            <button onclick="addTopic()" class="no-print mt-2 w-full px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition duration-200 ease-in-out font-medium shadow-sm">
+                + Add Topic
+            </button>
+        </div>
+
+        <!-- Export Button -->
+        <div class="flex justify-center pt-8">
+            <button id="export-button" class="w-full px-6 py-3 bg-green-500 text-white font-bold rounded-lg hover:bg-green-600 transition duration-300 ease-in-out shadow-lg flex items-center justify-center">
+                <span id="export-text">Export to PDF</span>
+                <svg id="loading-spinner" class="animate-spin h-5 w-5 text-white hidden" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+            </button>
+        </div>
+    </div>
+    
+    <!-- jsPDF and AutoTable CDNs -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+
+    <script>
+        // Function to dynamically add a new topic section
+        function addTopic() {
+            const topicsContainer = document.getElementById('topics-container');
+            const topicDiv = document.createElement('div');
+            topicDiv.className = 'bg-gray-50 rounded-lg p-4 space-y-4 shadow-sm relative';
+            topicDiv.innerHTML = `
+                <div class="flex justify-between items-center mb-2">
+                    <input type="text" value="Q4 Project Planning" placeholder="Topic Title (e.g., Q3 Planning)" class="topic-title font-semibold text-lg w-full bg-transparent focus:outline-none" />
+                    <button onclick="removeTopic(this)" class="no-print ml-4 text-gray-400 hover:text-red-600 transition duration-200">
+                         <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                    </button>
+                </div>
+                
+                <div class="space-y-2">
+                    <h3 class="font-medium text-sm text-gray-700">Discussion Notes</h3>
+                    <textarea placeholder="Discussed points for this topic..." rows="4" class="topic-notes w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 transition duration-200 ease-in-out border">We discussed initial timelines for the Q4 project, key deliverables, and assigning responsibilities for the first phase. The team is aligned on the overall strategy. We also went over potential roadblocks and how to address them.</textarea>
+                </div>
+                
+                <div class="space-y-2">
+                    <h3 class="font-medium text-sm text-gray-700">Decisions Made</h3>
+                    <ul class="decisions-list space-y-2"></ul>
+                    <button onclick="addListItem(this, 'Decision')" class="no-print w-full px-3 py-1 bg-indigo-500 text-white rounded-md hover:bg-indigo-600 transition duration-200 ease-in-out text-sm">
+                        + Add Decision
+                    </button>
+                </div>
+                
+                <div class="space-y-2">
+                    <h3 class="font-medium text-sm text-gray-700">Action Items</h3>
+                    <ul class="action-items-list space-y-2"></ul>
+                    <button onclick="addListItem(this, 'Action Item')" class="no-print w-full px-3 py-1 bg-indigo-500 text-white rounded-md hover:bg-indigo-600 transition duration-200 ease-in-out text-sm">
+                        + Add Action Item
+                    </button>
+                </div>
+                
+                <div class="space-y-2">
+                    <h3 class="font-medium text-sm text-gray-700">Suggested Next Steps</h3>
+                    <ul class="suggestions-list space-y-2"></ul>
+                    <button onclick="addListItem(this, 'Suggestion')" class="no-print w-full px-3 py-1 bg-indigo-500 text-white rounded-md hover:bg-indigo-600 transition duration-200 ease-in-out text-sm">
+                        + Add Suggestion
+                    </button>
+                </div>
+            `;
+            topicsContainer.appendChild(topicDiv);
+            
+            // Add initial list items
+            const decisionsList = topicDiv.querySelector('.decisions-list');
+            const actionItemsList = topicDiv.querySelector('.action-items-list');
+            const suggestionsList = topicDiv.querySelector('.suggestions-list');
+
+            addListItemContent(decisionsList, 'Finalized Q4 launch date.');
+            addListItemContent(actionItemsList, 'Sarah to create a project roadmap in G-sheets.');
+            addListItemContent(suggestionsList, 'Explore new marketing channels for the launch.');
+
+            // Add event listeners to clear default text on focus
+            const inputs = topicDiv.querySelectorAll('input, textarea');
+            inputs.forEach(input => {
+                input.addEventListener('focus', function() {
+                    if (this.value && this.getAttribute('data-default-value') === this.value) {
+                        this.value = '';
+                    }
+                });
+                input.addEventListener('blur', function() {
+                    if (this.value.trim() === '') {
+                        this.value = this.getAttribute('data-default-value');
+                    }
+                });
+            });
+        }
+        
+        // Helper function to add list items with default content
+        function addListItemContent(list, content) {
+            const li = document.createElement('li');
+            li.className = 'relative flex items-center bg-white rounded-md p-2 shadow-sm border border-gray-200';
+            li.innerHTML = `
+                <input type="text" value="${content}" placeholder="Enter a point" class="flex-grow bg-transparent focus:outline-none text-gray-800" data-default-value="${content}" />
+                <button onclick="removeListItem(this)" class="no-print ml-2 text-red-500 hover:text-red-700 transition duration-200 ease-in-out">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm6 0a1 1 0 11-2 0v6a1 1 0 112 0V8z" clip-rule="evenodd" />
+                    </svg>
+                </button>
+            `;
+            list.appendChild(li);
+        }
+
+        // Function to remove a topic and its content
+        function removeTopic(button) {
+            button.closest('.bg-gray-50').remove();
+        }
+
+        // Function to dynamically add a new list item under a specific topic
+        function addListItem(button, placeholder) {
+            const list = button.parentElement.querySelector('ul');
+            const li = document.createElement('li');
+            li.className = 'relative flex items-center bg-white rounded-md p-2 shadow-sm border border-gray-200';
+            li.innerHTML = `
+                <input type="text" placeholder="Enter ${placeholder}" class="flex-grow bg-transparent focus:outline-none text-gray-800" />
+                <button onclick="removeListItem(this)" class="no-print ml-2 text-red-500 hover:text-red-700 transition duration-200 ease-in-out">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm6 0a1 1 0 11-2 0v6a1 1 0 112 0V8z" clip-rule="evenodd" />
+                    </svg>
+                </button>
+            `;
+            list.appendChild(li);
+        }
+
+        // Function to remove a list item
+        function removeListItem(button) {
+            button.parentElement.remove();
+        }
+
+        // Event listener for the export button
+        document.getElementById('export-button').addEventListener('click', () => {
+            const exportButton = document.getElementById('export-button');
+            const exportText = document.getElementById('export-text');
+            const loadingSpinner = document.getElementById('loading-spinner');
+
+            // Show loading spinner and disable button
+            exportText.classList.add('hidden');
+            loadingSpinner.classList.remove('hidden');
+            exportButton.disabled = true;
+
+            // Get meeting details
+            const meetingTitle = document.getElementById('meeting-title').value || 'Untitled Meeting';
+            const meetingDate = document.getElementById('meeting-date').value || 'No Date Specified';
+            const attendees = document.getElementById('attendees').value || 'None specified';
+            const dialInAttendees = document.getElementById('dial-in-attendees').value || 'None specified';
+            
+            // Create a new jsPDF instance
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+            let yPos = 20;
+
+            // Add main title
+            doc.setFontSize(20);
+            doc.text("Meeting Notes", 105, yPos, null, null, "center");
+            yPos += 10;
+            
+            // Add meeting details
+            doc.setFontSize(12);
+            doc.text(`Title: ${meetingTitle}`, 20, yPos);
+            yPos += 7;
+            doc.text(`Date: ${meetingDate}`, 20, yPos);
+            yPos += 7;
+            doc.text(`Attendees (In-Person): ${attendees}`, 20, yPos);
+            yPos += 7;
+            doc.text(`Dial-in Attendees: ${dialInAttendees}`, 20, yPos);
+            yPos += 15;
+
+            // Get all topic sections
+            const topicDivs = document.querySelectorAll('#topics-container .bg-gray-50');
+            if (topicDivs.length === 0) {
+                 doc.text("No topics were recorded for this meeting.", 105, yPos, null, null, "center");
+            } else {
+                topicDivs.forEach(topicDiv => {
+                    const topicTitle = topicDiv.querySelector('.topic-title').value || 'Untitled Topic';
+                    const topicNotes = topicDiv.querySelector('.topic-notes').value || 'No discussion notes.';
+
+                    // Check for remaining space on the page
+                    if (yPos > doc.internal.pageSize.height - 40) {
+                        doc.addPage();
+                        yPos = 20;
+                    }
+
+                    // Add topic title and notes
+                    doc.setFontSize(16);
+                    doc.text(topicTitle, 20, yPos);
+                    yPos += 5;
+                    doc.setFontSize(10);
+                    const notesText = doc.splitTextToSize(`Discussion Notes: ${topicNotes}`, 170);
+                    doc.text(notesText, 25, yPos);
+                    yPos += (notesText.length * 5) + 5;
+
+                    // Add decisions, action items, and suggestions using autoTable
+                    const decisionsData = Array.from(topicDiv.querySelectorAll('.decisions-list input')).map(input => [input.value]);
+                    const actionItemsData = Array.from(topicDiv.querySelectorAll('.action-items-list input')).map(input => [input.value]);
+                    const suggestionsData = Array.from(topicDiv.querySelectorAll('.suggestions-list input')).map(input => [input.value]);
+
+                    doc.autoTable({
+                        startY: yPos,
+                        head: [['Decisions Made']],
+                        body: decisionsData.length > 0 ? decisionsData : [['No decisions recorded.']],
+                        theme: 'grid',
+                        headStyles: { fillColor: [68, 114, 196], fontStyle: 'bold' },
+                        columnStyles: { 0: { cellWidth: 'auto' } },
+                        margin: { left: 20, right: 20 },
+                    });
+
+                    yPos = doc.autoTable.previous.finalY + 5;
+
+                    doc.autoTable({
+                        startY: yPos,
+                        head: [['Action Items']],
+                        body: actionItemsData.length > 0 ? actionItemsData : [['No action items recorded.']],
+                        theme: 'grid',
+                        headStyles: { fillColor: [25, 135, 84], fontStyle: 'bold' },
+                        columnStyles: { 0: { cellWidth: 'auto' } },
+                        margin: { left: 20, right: 20 },
+                    });
+                    
+                    yPos = doc.autoTable.previous.finalY + 5;
+
+                    doc.autoTable({
+                        startY: yPos,
+                        head: [['Suggested Next Steps']],
+                        body: suggestionsData.length > 0 ? suggestionsData : [['No suggestions recorded.']],
+                        theme: 'grid',
+                        headStyles: { fillColor: [255, 193, 7], fontStyle: 'bold' },
+                        columnStyles: { 0: { cellWidth: 'auto' } },
+                        margin: { left: 20, right: 20 },
+                    });
+                    
+                    yPos = doc.autoTable.previous.finalY + 15;
+                });
+            }
+
+            // Save the PDF
+            doc.save(`Meeting Notes - ${meetingDate || 'Untitled'}.pdf`);
+            
+            // Hide loading spinner and enable button
+            exportText.classList.remove('hidden');
+            loadingSpinner.classList.add('hidden');
+            exportButton.disabled = false;
+        });
+
+        // Add an initial topic when the page loads
+        window.onload = () => {
+             addTopic();
+        };
+    </script>
+</body>
+</html>
