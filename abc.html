@@ -1,0 +1,1476 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, query, where, addDoc, updateDoc, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { setLogLevel } from 'firebase/firestore'; // For debugging
+
+// --- 1. GLOBAL ENVIRONMENT SETUP, CONSTANTS & UTILS ---
+
+// Global variables provided by the environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'qaida-tracker-default';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? initialAuthToken : null;
+
+// NEW CONSTANTS FOR GROUPING
+const TOTAL_LESSONS = 29;
+
+const GROUPS_CONFIG = {
+  L1: { targetLesson: 10, range: '1-10', name: 'Level 1' },
+  L2: { targetLesson: 20, range: '11-20', name: 'Level 2' },
+  L3: { targetLesson: TOTAL_LESSONS, range: `21-${TOTAL_LESSONS}`, name: 'Level 3' },
+};
+
+const GROUP_NAMES = [
+  { id: 'M1', group: 'L1', gender: 'Male', label: 'Male Level 1', color: 'indigo' },
+  { id: 'F1', group: 'L1', gender: 'Female', label: 'Female Level 1', color: 'pink' },
+  { id: 'M2', group: 'L2', gender: 'Male', label: 'Male Level 2', color: 'blue' },
+  { id: 'F2', group: 'L2', gender: 'Female', label: 'Female Level 2', color: 'purple' },
+  { id: 'M3', group: 'L3', gender: 'Male', label: 'Male Level 3', color: 'green' },
+  { id: 'F3', group: 'L3', gender: 'Female', label: 'Female Level 3', color: 'teal' },
+];
+
+// Firestore Path Helpers
+const getStudentCollectionPath = (uid) => `artifacts/${appId}/users/${uid}/students`;
+const getLogCollectionPath = (uid) => `artifacts/${appId}/users/${uid}/progressLogs`;
+const getTeachersCollectionPath = () => `artifacts/${appId}/public/data/teachers`;
+
+// Date Formatting Utility
+const formatDate = (timestamp) => {
+  if (!timestamp) return 'N/A';
+  const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+  return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+// Pace Calculation (remains the same logic)
+const calculatePace = (currentLesson, groupTargetLesson, targetDate) => {
+  const lessonsRemaining = groupTargetLesson - currentLesson;
+
+  if (lessonsRemaining <= 0) {
+    return { pace: 0, unit: 'Complete', requiredDailyRate: 0 }; 
+  }
+
+  const now = new Date();
+  const target = targetDate.toDate ? targetDate.toDate() : new Date(targetDate);
+  const daysRemaining = Math.max(1, Math.ceil((target.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))); // Ensure at least 1 day remaining
+
+  const requiredDailyRate = lessonsRemaining / daysRemaining; // The true floating-point daily rate
+
+  const requiredWeeklyPace = requiredDailyRate * 7;
+
+  const ceilDaily = Math.ceil(requiredDailyRate);
+  const ceilWeekly = Math.ceil(requiredWeeklyPace);
+
+  if (ceilDaily >= 1) {
+    return { pace: ceilDaily, unit: 'Lesson(s) per Day', requiredDailyRate };
+  } else {
+    return { pace: Math.max(1, ceilWeekly), unit: 'Lesson(s) per Week', requiredDailyRate };
+  }
+};
+
+const calculateActualPace = (studentId, logs) => {
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const recentLogs = logs
+    .filter(log => log.studentId === studentId && log.date.toDate() >= thirtyDaysAgo)
+    .sort((a, b) => a.date.toDate() - b.date.toDate()); // Sort ascending
+
+  if (recentLogs.length < 2) {
+    return 0; // Not enough data
+  }
+
+  const recentPassLogs = recentLogs.filter(log => log.logType === 'Pass'); 
+
+  if (recentPassLogs.length < 2) {
+    return 0; // Not enough pass data
+  }
+
+  const minLesson = Math.min(...recentPassLogs.map(log => log.lessonNumber));
+  const maxLesson = Math.max(...recentPassLogs.map(log => log.lessonNumber));
+
+  const lessonsCovered = maxLesson - minLesson;
+
+  return lessonsCovered / 30;
+};
+
+// Component for the Daily Progress Form
+const DailyProgressForm = ({ activeStudent, handleLogProgress, totalLessons }) => {
+    const [lessonNumber, setLessonNumber] = useState(activeStudent.currentUnitNumber + 1);
+    const [detail, setDetail] = useState('');
+    const [notes, setNotes] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+  
+    // Update lesson number default when active student changes
+    useEffect(() => {
+      // Default to the next sequential lesson
+      const nextLesson = activeStudent.currentUnitNumber + 1;
+      setLessonNumber(Math.min(totalLessons, nextLesson)); 
+      setDetail('');
+      setNotes('');
+    }, [activeStudent, totalLessons]);
+  
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      if (!lessonNumber || !detail) return;
+  
+      setIsLoading(true);
+      await handleLogProgress(lessonNumber, detail, notes);
+      setIsLoading(false);
+  
+      // After logging, reset form to suggest the next logical step
+      const nextLesson = activeStudent.currentUnitNumber + 1;
+      setLessonNumber(Math.min(totalLessons, nextLesson)); 
+      setDetail('');
+      setNotes('');
+    };
+  
+    const lessonOptions = useMemo(() => {
+      const options = [];
+      // Allow logging any lesson up to the max total (29)
+      for (let i = 1; i <= totalLessons; i++) {
+        options.push(i);
+      }
+      return options;
+    }, [totalLessons]);
+    
+    // Dynamic text based on the selected lesson number
+    const statusText = lessonNumber > activeStudent.currentUnitNumber 
+      ? "Will be logged as: PASS (advances highest progress)" 
+      : "Will be logged as: REVIEW (for practice/revision)";
+  
+    const statusColor = lessonNumber > activeStudent.currentUnitNumber 
+      ? "text-green-600" 
+      : "text-yellow-600";
+  
+    return (
+      <div className="bg-white shadow-lg rounded-xl p-4 sm:p-6 mb-6">
+        <h2 className="text-xl font-semibold text-gray-800 border-b pb-2 mb-4">Daily Progress Log</h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          
+          <div>
+            <label htmlFor="lessonNumber" className="block text-sm font-medium text-gray-700 mb-1">Lesson Number (Max {totalLessons}):</label>
+            <select
+              id="lessonNumber"
+              value={lessonNumber}
+              onChange={(e) => setLessonNumber(Number(e.target.value))}
+              className="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+              required
+            >
+              {lessonOptions.map(num => (
+                <option 
+                  key={num} 
+                  value={num}
+                >
+                  Lesson {num}
+                </option>
+              ))}
+            </select>
+          </div>
+          
+          {/* Automatic Status Preview */}
+          <div className={`text-sm font-semibold p-2 rounded-lg bg-gray-100 ${statusColor}`}>
+            {statusText}
+          </div>
+  
+          <div>
+            <label htmlFor="detail" className="block text-sm font-medium text-gray-700 mb-1">Progress Detail:</label>
+            <textarea
+              id="detail"
+              placeholder="e.g., Passed Lesson 12 perfectly, worked on pronunciation of throat letters."
+              rows="3"
+              value={detail}
+              onChange={(e) => setDetail(e.target.value)}
+              className="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 resize-none"
+              required
+            />
+          </div>
+          <div>
+            <label htmlFor="notes" className="block text-sm font-medium text-gray-700 mb-1">Teacher Notes (Optional):</label>
+            <input
+              id="notes"
+              type="text"
+              placeholder="e.g., Highly motivated today."
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="w-full px-4 py-2 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 transition disabled:opacity-50"
+          >
+            {isLoading ? 'Saving...' : 'Log Progress'}
+          </button>
+        </form>
+      </div>
+    );
+};
+
+// UPDATED: Side Navigation Component for mobile view, now including Group/Class filtering
+const SideNav = ({ 
+    isOpen, 
+    closeNav, 
+    setViewMode, 
+    currentViewMode, 
+    userId, 
+    openManageTeachersModal, 
+    openAddStudentModal, 
+    setFilterMode, 
+    setGroupFilter 
+}) => {
+    const [isClassesOpen, setIsClassesOpen] = useState(false);
+
+    // Determine the transition class based on the state
+    const navClasses = isOpen
+        ? 'translate-x-0'
+        : 'translate-x-full';
+
+    const MenuItem = ({ view, label, icon, onClick = null, classes = '' }) => (
+        <button
+            onClick={onClick || (() => {
+                setViewMode(view);
+                setFilterMode('Group'); // Default to Group filter mode when changing view to tracker
+                setGroupFilter('All');
+                closeNav();
+            })}
+            className={`w-full text-left flex items-center p-3 rounded-lg font-semibold transition ${
+                currentViewMode === view && !onClick
+                    ? 'bg-indigo-700 text-white shadow-lg'
+                    : 'text-indigo-100 hover:bg-indigo-600'
+            } ${classes}`}
+        >
+            {icon}
+            <span className="ml-3">{label}</span>
+        </button>
+    );
+
+    const handleGroupClick = (groupId) => {
+        setViewMode('tracker');
+        setFilterMode('Group');
+        setGroupFilter(groupId);
+        closeNav();
+    };
+
+
+    return (
+        <>
+            {/* Backdrop */}
+            {isOpen && (
+                <div
+                    className="fixed inset-0 z-40 bg-gray-900 bg-opacity-50 lg:hidden"
+                    onClick={closeNav}
+                ></div>
+            )}
+
+            {/* Side Menu - Note: flex and flex-col for proper height management */}
+            <div
+                className={`fixed top-0 right-0 w-64 h-full flex flex-col bg-indigo-800 p-6 shadow-2xl z-50 transform ease-in-out duration-300 ${navClasses}`}
+            >
+                <div className="flex justify-between items-center mb-8 border-b border-indigo-700 pb-4">
+                    <h2 className="text-xl font-bold text-white">Menu</h2>
+                    <button onClick={closeNav} className="text-indigo-200 hover:text-white transition">
+                        {/* Close Icon (X) */}
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                <nav className="space-y-3 flex-grow">
+                    {/* Global Dashboard Link */}
+                    <MenuItem 
+                        view="dashboard" 
+                        label="Global Dashboard" 
+                        icon={
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                            </svg>
+                        }
+                    />
+                    
+                    {/* Collapsible Classes/Groups Menu */}
+                    <div className="border-t border-indigo-700 pt-3">
+                        <button
+                            onClick={() => setIsClassesOpen(!isClassesOpen)}
+                            className="w-full text-left flex items-center p-3 rounded-lg font-semibold transition text-indigo-100 hover:bg-indigo-600"
+                        >
+                            {/* Icon for Classes */}
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.354a4 4 0 110 5.292M12 20.646l-2.25-2.25M12 3v18m0-12a4 4 0 100 8m-4.5 4.5l-2.25 2.25M16.5 16.5l2.25 2.25M3 12h18" />
+                            </svg>
+                            <span className="ml-3">Classes (Student Tracker)</span>
+                            {/* Chevron Icon */}
+                            <svg xmlns="http://www.w3.org/2000/svg" className={`h-5 w-5 ml-auto transform transition ${isClassesOpen ? 'rotate-90' : 'rotate-0'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                            </svg>
+                        </button>
+
+                        {/* Dropdown List of Groups */}
+                        {isClassesOpen && (
+                            <div className="mt-2 space-y-1 pl-4">
+                                {/* All Students/Tracker Link */}
+                                <MenuItem 
+                                    view="tracker" 
+                                    label="All Students" 
+                                    classes="!pl-6 text-sm"
+                                    icon={
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                                        </svg>
+                                    }
+                                />
+                                {GROUP_NAMES.map(group => (
+                                    <button
+                                        key={group.id}
+                                        onClick={() => handleGroupClick(group.id)}
+                                        className="w-full text-left flex items-center p-2 rounded-lg text-sm transition text-indigo-200 hover:bg-indigo-700 pl-6"
+                                    >
+                                        <span className={`h-2 w-2 rounded-full mr-2 bg-${group.color}-400`}></span>
+                                        {group.label} ({group.id})
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                    
+                    {/* UPDATED: ENROLLMENT & ADMIN ACTIONS SECTION */}
+                    <div className="pt-4 border-t border-indigo-700 space-y-3">
+                        <h4 className="text-sm font-semibold text-indigo-200 mb-1">Enrollment & Admin</h4>
+                        <button
+                            onClick={openAddStudentModal}
+                            // UPDATED TEXT
+                            className="w-full px-4 py-2 bg-green-500 text-white text-sm rounded-lg hover:bg-green-400 font-semibold transition flex items-center justify-center"
+                        >
+                            {/* User Plus Icon */}
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M8 9a3 3 0 100-6 3 3 0 000 6zM8 11a6 6 0 016 6H2a6 6 0 016-6zM16 7a1 1 0 10-2 0v1h-1a1 1 0 100 2h1v1a1 1 0 102 0v-1h1a1 1 0 100-2h-1V7z" />
+                            </svg>
+                            Add Student
+                        </button>
+                        <button
+                            onClick={openManageTeachersModal}
+                            // UPDATED TEXT
+                            className="w-full px-4 py-2 bg-indigo-500 text-white text-sm rounded-lg hover:bg-indigo-400 font-semibold transition flex items-center justify-center"
+                        >
+                            {/* Teacher/Users Icon */}
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                            </svg>
+                            Add Teacher
+                        </button>
+                    </div>
+                </nav>
+
+                {/* ADMIN/STATUS FOOTER SECTION */}
+                <div className="mt-auto pt-4 border-t border-indigo-700">
+                    <h4 className="text-sm font-semibold text-indigo-200 mb-2">My User ID</h4>
+                    <div className="mb-4">
+                        <p className="break-all font-mono text-xs p-2 bg-indigo-700 rounded-lg shadow-inner">
+                            {userId}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </>
+    );
+};
+
+
+// --- 2. MAIN APPLICATION COMPONENT ---
+
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null); // The user's unique ID (the administrator/logged-in user)
+  
+  const [students, setStudents] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [teachers, setTeachers] = useState([]); // Array of { id: docId, name: string }
+  
+  const [activeStudentId, setActiveStudentId] = useState(null);
+  
+  const [filterMode, setFilterMode] = useState('Group'); 
+  const [groupFilter, setGroupFilter] = useState('All'); 
+  const [teacherFilter, setTeacherFilter] = useState('All'); // Holds the Teacher's ID for filtering
+
+  const [searchTerm, setSearchTerm] = useState(''); // NEW: Moved search state higher up
+  
+  // Memoized current active student
+  const activeStudent = useMemo(() => students.find(s => s.id === activeStudentId), [students, activeStudentId]);
+  const activeStudentGroupConfig = activeStudent ? GROUPS_CONFIG[activeStudent.curriculumGroup] : null; 
+
+  const [isAddStudentModalOpen, setIsAddStudentModalOpen] = useState(false);
+  const [isSetGoalModalOpen, setIsSetGoalModalOpen] = useState(false);
+  const [isReassignModalOpen, setIsReassignModalOpen] = useState(false); 
+  const [isManageTeachersModalOpen, setIsManageTeachersModalOpen] = useState(false);
+
+  // NEW STATES FOR NAVIGATION
+  const [viewMode, setViewMode] = useState('tracker'); // 'tracker' or 'dashboard'
+  const [isNavOpen, setIsNavOpen] = useState(false); // State for hamburger menu
+
+
+  // 1. Firebase Initialization and Authentication
+  useEffect(() => {
+    try {
+      setLogLevel('debug');
+      const app = initializeApp(firebaseConfig);
+      const newAuth = getAuth(app);
+      const newDb = getFirestore(app);
+
+      setAuth(newAuth);
+      setDb(newDb);
+
+      const unsubscribe = onAuthStateChanged(newAuth, async (user) => {
+        let currentUserId = null;
+        if (user) {
+          currentUserId = user.uid;
+        } else {
+          try {
+            if (initialAuthToken) {
+              const credentials = await signInWithCustomToken(newAuth, initialAuthToken);
+              currentUserId = credentials.user.uid;
+            } else {
+              const credentials = await signInAnonymously(newAuth);
+              currentUserId = credentials.user.uid;
+            }
+          } catch (error) {
+            console.error("Firebase Auth Error:", error);
+            currentUserId = 'fallback-anonymous-' + crypto.randomUUID(); 
+          }
+        }
+        
+        setUserId(currentUserId);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Failed to initialize Firebase:", e);
+    }
+  }, []);
+
+  // 2. Real-time Firestore Listeners
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    // Student and Log Listeners (Private Data)
+    const studentsCollectionRef = collection(db, getStudentCollectionPath(userId));
+    const unsubscribeStudents = onSnapshot(studentsCollectionRef, (snapshot) => {
+      const studentList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setStudents(studentList);
+      if (studentList.length > 0 && !activeStudentId) {
+        setActiveStudentId(studentList[0].id);
+      }
+    }, (error) => console.error("Error listening to students:", error));
+
+    const logsCollectionRef = collection(db, getLogCollectionPath(userId));
+    const unsubscribeLogs = onSnapshot(logsCollectionRef, (snapshot) => {
+      const logList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setLogs(logList);
+    }, (error) => console.error("Error listening to logs:", error));
+
+    // Teacher List Listener (Public Data)
+    const teachersRef = collection(db, getTeachersCollectionPath());
+    const unsubscribeTeachers = onSnapshot(teachersRef, (snapshot) => {
+        const teacherList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setTeachers(teacherList.sort((a, b) => a.name.localeCompare(b.name)));
+    }, (error) => console.error("Error listening to teachers:", error));
+
+
+    return () => {
+      unsubscribeStudents();
+      unsubscribeLogs();
+      unsubscribeTeachers();
+    };
+  }, [db, userId, activeStudentId]);
+  
+  // Helper to get the display name for a teacher ID (doc ID)
+  const getTeacherDisplayName = useCallback((teacherDocId) => {
+    const teacher = teachers.find(t => t.id === teacherDocId);
+    return teacher ? teacher.name : `Unassigned / ID: ${teacherDocId ? teacherDocId.substring(0, 8) + '...' : 'N/A'}`;
+  }, [teachers]);
+
+
+  // --- 3. CRUD & Action Handlers (Remain the same) ---
+
+  const handleAddTeacher = async (name) => {
+    if (!db || !name.trim()) return;
+
+    try {
+        const teachersCollectionRef = collection(db, getTeachersCollectionPath());
+        await addDoc(teachersCollectionRef, {
+            name: name.trim(),
+            dateAdded: new Date(),
+        });
+    } catch (error) {
+        console.error("Error adding teacher:", error);
+    }
+  };
+
+  const handleDeleteTeacher = async (teacherDocId) => {
+    if (!db || !teacherDocId) return;
+    try {
+        const teacherDocRef = doc(db, getTeachersCollectionPath(), teacherDocId);
+        await deleteDoc(teacherDocRef);
+    } catch (error) {
+        console.error("Error deleting teacher:", error);
+    }
+  };
+
+  const handleAddStudent = async (name, gender, groupKey, teacherDocId) => {
+    if (!db || !userId || !name || !gender || !groupKey || !teacherDocId) return;
+
+    const groupId = GROUP_NAMES.find(g => g.gender === gender && g.group === groupKey)?.id;
+    const groupConfig = GROUPS_CONFIG[groupKey];
+
+    if (!groupId || !groupConfig) {
+      console.error("Invalid group parameters.");
+      return;
+    }
+
+    try {
+      const newStudent = {
+        name,
+        teacherName: teacherDocId, // **Stores the manually managed Teacher Document ID**
+        groupId, 
+        curriculumGroup: groupKey, 
+        currentUnitNumber: 0, 
+        goalTargetUnits: groupConfig.targetLesson,
+        goalUnitType: "Lessons",
+        goalTargetDate: new Date(new Date().setMonth(new Date().getMonth() + 6)), 
+        userId: userId, 
+      };
+
+      const studentsCollectionRef = collection(db, getStudentCollectionPath(userId));
+      const docRef = await addDoc(studentsCollectionRef, newStudent);
+
+      setActiveStudentId(docRef.id);
+      setIsAddStudentModalOpen(false);
+    } catch (error) {
+      console.error("Error adding student:", error);
+    }
+  };
+
+  const handleLogProgress = async (lessonNumber, detail, notes) => {
+    if (!db || !userId || !activeStudent) return;
+    const lesson = Number(lessonNumber);
+    
+    const logType = lesson > activeStudent.currentUnitNumber ? 'Pass' : 'Review';
+
+    try {
+      const logsCollectionRef = collection(db, getLogCollectionPath(userId));
+      await addDoc(logsCollectionRef, {
+        studentId: activeStudent.id,
+        date: new Date(),
+        lessonNumber: lesson,
+        progressDetail: detail,
+        teacherNotes: notes || '',
+        logType: logType,
+        loggedByUserId: userId, 
+      });
+
+      if (logType === 'Pass') {
+        const studentDocRef = doc(db, getStudentCollectionPath(userId), activeStudent.id);
+        await updateDoc(studentDocRef, {
+          currentUnitNumber: lesson,
+        });
+      }
+    } catch (error) {
+      console.error("Error logging progress:", error);
+    }
+  };
+
+  const handleSetGoal = async (newDate) => {
+    if (!db || !userId || !activeStudent || !newDate) return;
+
+    try {
+      const studentDocRef = doc(db, getStudentCollectionPath(userId), activeStudent.id);
+      await updateDoc(studentDocRef, {
+        goalTargetDate: new Date(newDate),
+      });
+      setIsSetGoalModalOpen(false);
+    } catch (error) {
+      console.error("Error setting goal:", error);
+    }
+  };
+
+  const handleReassignTeacher = async (studentId, newTeacherDocId) => {
+    if (!db || !userId || !studentId || !newTeacherDocId) return;
+
+    try {
+        const studentDocRef = doc(db, getStudentCollectionPath(userId), studentId);
+        await updateDoc(studentDocRef, {
+            teacherName: newTeacherDocId, // Store the new teacher's document ID
+        });
+        setIsReassignModalOpen(false);
+    } catch (error) {
+        console.error("Error reassigning teacher:", error);
+    }
+  };
+
+  // --- 4. Analytics and Reporting Logic (Remains the same) ---
+
+  const analytics = useMemo(() => {
+    if (!students.length || !logs.length) return {};
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const totalStudents = students.length;
+    const logsLast7Days = logs.filter(log => log.date.toDate() >= sevenDaysAgo).length; 
+    
+    const totalNormalizedProgress = students.reduce((sum, s) => {
+      const groupTarget = GROUPS_CONFIG[s.curriculumGroup]?.targetLesson || TOTAL_LESSONS;
+      const normalizedProgress = (s.currentUnitNumber / groupTarget);
+      return sum + normalizedProgress;
+    }, 0);
+    const averageNormalizedProgress = totalStudents > 0 ? totalNormalizedProgress / totalStudents : 0;
+    const averageProgressPercent = Math.round(averageNormalizedProgress * 100);
+
+    const atRiskStudents = [];
+
+    for (const student of students) {
+      const groupTarget = GROUPS_CONFIG[student.curriculumGroup]?.targetLesson || TOTAL_LESSONS;
+      
+      if (groupTarget > 0) {
+        const { 
+          requiredDailyRate: targetDailyRate 
+        } = calculatePace(student.currentUnitNumber, groupTarget, student.goalTargetDate);
+
+        if (targetDailyRate > 0) {
+          const actualDailyPace = calculateActualPace(student.id, logs);
+          if (actualDailyPace > 0 && actualDailyPace < targetDailyRate * 0.8) {
+            atRiskStudents.push({ 
+              ...student, 
+              requiredPaceValue: calculatePace(student.currentUnitNumber, groupTarget, student.goalTargetDate).pace, 
+              requiredPaceUnit: calculatePace(student.currentUnitNumber, groupTarget, student.goalTargetDate).unit, 
+            });
+          }
+        }
+      }
+    }
+
+    const studentActivity = {};
+    for (const student of students) {
+        const activityCount = logs.filter(log =>
+            log.studentId === student.id && log.date.toDate() >= thirtyDaysAgo
+        ).length;
+        studentActivity[student.id] = activityCount;
+    }
+
+    const sortedActivity = Object.entries(studentActivity)
+      .map(([id, count]) => ({ student: students.find(s => s.id === id)?.name || 'Unknown', count }))
+      .filter(a => a.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 3);
+
+    return {
+      totalStudents,
+      logsLast7Days,
+      averageProgressPercent,
+      atRiskStudents,
+      topActiveStudents: sortedActivity
+    };
+  }, [students, logs]);
+
+  // Filter students based on filter mode, filter value, and search term (UPDATED FOR TEACHER DOC ID)
+  const filteredStudents = useMemo(() => {
+    let list = students;
+    
+    // 1. Apply Group Filter
+    if (filterMode === 'Group' && groupFilter !== 'All') {
+      list = list.filter(s => s.groupId === groupFilter);
+    }
+    
+    // 2. Apply Teacher Filter (using the Teacher's DOC ID)
+    if (filterMode === 'Teacher' && teacherFilter !== 'All') {
+        list = list.filter(s => s.teacherName === teacherFilter);
+    }
+
+    // 3. Apply Search Term (search name, groupId, or teacherName/DOC ID)
+    if (searchTerm) {
+      const lowerCaseSearch = searchTerm.toLowerCase();
+      list = list.filter(s => 
+        s.name.toLowerCase().includes(lowerCaseSearch) || 
+        s.groupId.toLowerCase().includes(lowerCaseSearch) || 
+        (getTeacherDisplayName(s.teacherName).toLowerCase().includes(lowerCaseSearch)) // Search the display name
+      );
+    }
+    return list;
+  }, [students, searchTerm, filterMode, groupFilter, teacherFilter, getTeacherDisplayName]);
+  
+  
+
+  if (!userId) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="text-xl text-indigo-600">Loading Tracker...</div>
+      </div>
+    );
+  }
+
+  // --- 5. RENDER HELPER COMPONENTS (Modals, Panels) ---
+
+  const PanelCard = ({ title, children, className = '' }) => (
+    <div className={`bg-white shadow-lg rounded-xl p-4 sm:p-6 mb-6 ${className}`}>
+      <h2 className="text-xl font-semibold text-gray-800 border-b pb-2 mb-4">{title}</h2>
+      {children}
+    </div>
+  );
+
+  const ManageTeachersModal = () => {
+    const [newTeacherName, setNewTeacherName] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (newTeacherName.trim()) {
+            setIsLoading(true);
+            await handleAddTeacher(newTeacherName.trim());
+            setNewTeacherName('');
+            setIsLoading(false);
+        }
+    };
+
+    const handleDelete = async (id) => {
+        console.log(`ATTENTION: In a production app, a custom modal is required here. Deleting teacher ID: ${id}`); 
+        
+        if (window.confirm("Are you sure you want to delete this teacher? Students assigned to them will show 'Unassigned'.")) { 
+            setIsLoading(true);
+            await handleDeleteTeacher(id);
+            setIsLoading(false);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-75 backdrop-blur-sm">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-xl p-6">
+                {/* UPDATED TITLE */}
+                <h3 className="text-2xl font-bold mb-4 text-indigo-600">Add/Manage Teachers</h3>
+                
+                <form onSubmit={handleSubmit} className="mb-6 border-b pb-4">
+                    <label htmlFor="teacher-name" className="block text-sm font-medium text-gray-700 mb-1">Add New Teacher:</label>
+                    <div className="flex space-x-2">
+                        <input
+                            id="teacher-name"
+                            type="text"
+                            placeholder="e.g., Ustadha Maryam"
+                            value={newTeacherName}
+                            onChange={(e) => setNewTeacherName(e.target.value)}
+                            className="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            required
+                        />
+                        <button
+                            type="submit"
+                            className="px-4 py-3 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 transition disabled:opacity-50"
+                            disabled={isLoading}
+                        >
+                            {isLoading ? 'Adding...' : 'Add'}
+                        </button>
+                    </div>
+                </form>
+
+                <h4 className="font-semibold text-gray-800 mb-3">Current Teachers ({teachers.length})</h4>
+                <div className="max-h-60 overflow-y-auto space-y-2 pr-2">
+                    {teachers.length === 0 ? (
+                        <p className="text-gray-500 italic">No teachers added yet. Please add one to assign students.</p>
+                    ) : (
+                        teachers.map(teacher => (
+                            <div key={teacher.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg border">
+                                <span className="font-medium text-gray-700 truncate">{teacher.name}</span>
+                                <div className="flex items-center space-x-2">
+                                    <span className="text-xs font-mono text-gray-500 break-all" title={`Teacher Doc ID: ${teacher.id}`}>{teacher.id.substring(0, 8)}...</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => handleDelete(teacher.id)}
+                                        className="text-red-500 hover:text-red-700 transition"
+                                        title="Delete Teacher"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                            <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clipRule="evenodd" />
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        ))
+                    )}
+                </div>
+
+                <div className="flex justify-end mt-6">
+                    <button
+                        type="button"
+                        onClick={() => setIsManageTeachersModalOpen(false)}
+                        className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition"
+                    >
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+  };
+
+  const AddStudentModal = () => {
+    const [name, setName] = useState('');
+    const [gender, setGender] = useState('Male');
+    const [groupKey, setGroupKey] = useState('L1'); // L1, L2, L3 keys
+    // New state to hold the selected teacher's document ID
+    const [selectedTeacherId, setSelectedTeacherId] = useState(teachers[0]?.id || '');
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      if (name.trim() && selectedTeacherId) {
+        // Pass the selected teacher's document ID
+        handleAddStudent(name.trim(), gender, groupKey, selectedTeacherId); 
+        setName('');
+      } else if (!selectedTeacherId) {
+        console.error("Please select a teacher.");
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-75">
+        <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6">
+          {/* UPDATED TITLE */}
+          <h3 className="text-2xl font-bold mb-4 text-indigo-600">Add Student</h3>
+          <form onSubmit={handleSubmit}>
+            
+            <input
+              type="text"
+              placeholder="Student's Full Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:ring-indigo-500 focus:border-indigo-500"
+              required
+            />
+            
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Gender</label>
+                <select 
+                  value={gender} 
+                  onChange={(e) => setGender(e.target.value)}
+                  className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                >
+                  <option value="Male">Male</option>
+                  <option value="Female">Female</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Group</label>
+                <select 
+                  value={groupKey} 
+                  onChange={(e) => setGroupKey(e.target.value)}
+                  className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                >
+                  {Object.entries(GROUPS_CONFIG).map(([key, config]) => (
+                    <option key={key} value={key}>
+                      Group ({config.name})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="mb-6">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Assign Teacher</label>
+                {teachers.length === 0 ? (
+                    <p className="p-3 bg-red-100 text-red-700 rounded-lg text-sm">
+                        No teachers found. Please add a teacher via "Add Teacher" before enrolling.
+                    </p>
+                ) : (
+                    <select
+                        value={selectedTeacherId}
+                        onChange={(e) => setSelectedTeacherId(e.target.value)}
+                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                        required
+                    >
+                        <option value="" disabled>Select an Assigned Teacher</option>
+                        {teachers.map(teacher => (
+                            <option key={teacher.id} value={teacher.id}>
+                                {teacher.name}
+                            </option>
+                        ))}
+                    </select>
+                )}
+            </div>
+
+            <div className="flex justify-end space-x-3">
+              <button
+                type="button"
+                onClick={() => setIsAddStudentModalOpen(false)}
+                className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition disabled:opacity-50"
+                disabled={teachers.length === 0}
+              >
+                Enroll Student
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  };
+
+  const SetGoalModal = () => {
+    const defaultDate = activeStudent?.goalTargetDate?.toDate().toISOString().split('T')[0] || '';
+    const [newDate, setNewDate] = useState(defaultDate);
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      if (newDate) {
+        handleSetGoal(newDate);
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-75">
+        <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6">
+          <h3 className="text-2xl font-bold mb-4 text-indigo-600">Set Group Goal Date</h3>
+          <form onSubmit={handleSubmit}>
+            <div className="mb-4">
+              <label className="block text-gray-700 font-medium mb-1">Target Group:</label> 
+              <p className="p-3 bg-gray-50 border rounded-lg font-mono">
+                {activeStudentGroupConfig.name} (Lessons {activeStudentGroupConfig.range})
+              </p>
+            </div>
+            <div className="mb-4">
+              <label htmlFor="target-date" className="block text-sm font-medium text-gray-700 mb-1">New Target Date:</label>
+              <input
+                id="target-date"
+                type="date"
+                value={newDate}
+                onChange={(e) => setNewDate(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                required
+              />
+            </div>
+            <div className="flex justify-end space-x-3">
+              <button
+                type="button"
+                onClick={() => setIsSetGoalModalOpen(false)}
+                className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition"
+              >
+                Save Goal
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  };
+
+  const ReassignTeacherModal = () => {
+    const currentTeacherName = getTeacherDisplayName(activeStudent?.teacherName);
+    const [newTeacherDocId, setNewTeacherDocId] = useState(activeStudent?.teacherName || '');
+    const [isLoading, setIsLoading] = useState(false);
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (newTeacherDocId.trim() && activeStudent) {
+            setIsLoading(true);
+            await handleReassignTeacher(activeStudent.id, newTeacherDocId.trim());
+            setIsLoading(false);
+        }
+    };
+
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-75">
+        <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6">
+          <h3 className="text-2xl font-bold mb-4 text-red-600">Reassign Teacher</h3>
+          <p className="text-sm text-gray-600 mb-4">
+            Currently, the student **{activeStudent?.name}** is assigned to Teacher: 
+            <span className="font-bold break-all ml-2 text-indigo-700">{currentTeacherName}</span>
+          </p>
+          <form onSubmit={handleSubmit}>
+            <div className="mb-4">
+              <label htmlFor="new-teacher-id" className="block text-sm font-medium text-gray-700 mb-1">Select New Teacher:</label>
+              <select
+                id="new-teacher-id"
+                value={newTeacherDocId}
+                onChange={(e) => setNewTeacherDocId(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500"
+                required
+              >
+                <option value="" disabled>Select Teacher</option>
+                {teachers.map(teacher => (
+                    <option key={teacher.id} value={teacher.id}>
+                        {teacher.name}
+                    </option>
+                ))}
+              </select>
+            </div>
+            <p className="text-xs text-red-500 mb-6 p-2 bg-red-50 rounded-lg border border-red-200">
+                **Note:** This only updates the teacher label on this student record. Student progress remains unaffected.
+            </p>
+            <div className="flex justify-end space-x-3">
+              <button
+                type="button"
+                onClick={() => setIsReassignModalOpen(false)}
+                className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition"
+                disabled={isLoading}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-red-600 text-white font-semibold rounded-lg shadow-md hover:bg-red-700 transition disabled:opacity-50"
+                disabled={isLoading}
+              >
+                {isLoading ? 'Reassigning...' : 'Confirm Reassignment'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  };
+  
+  // Extracted the Dashboard content into a reusable component/function for conditional rendering
+  const renderGlobalDashboard = () => (
+    <div className="lg:col-span-full xl:col-span-full">
+        <h2 className="text-3xl font-extrabold text-gray-900 mb-6">Global Dashboard View</h2>
+        
+        {/* The existing Global Analytics card (Panel B's content) */}
+        <PanelCard title="System Analytics" className="bg-indigo-50 border-2 border-indigo-200">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+            <div className="text-center p-3 bg-white rounded-lg shadow-sm">
+              <p className="text-3xl font-bold text-indigo-700">{analytics.totalStudents || 0}</p>
+              <p className="text-sm text-gray-600">Total Students</p>
+            </div>
+            <div className="text-center p-3 bg-white rounded-lg shadow-sm">
+              <p className="text-3xl font-bold text-indigo-700">{analytics.logsLast7Days || 0}</p>
+              <p className="text-sm text-gray-600">Logs (Last 7 Days)</p>
+            </div>
+            <div className="text-center p-3 bg-white rounded-lg shadow-sm">
+              <p className="text-3xl font-bold text-indigo-700">{analytics.averageProgressPercent || 0}%</p>
+              <p className="text-sm text-gray-600">Avg. Group Progress</p>
+            </div>
+            <div className="text-center p-3 bg-white rounded-lg shadow-sm">
+              <p className={`text-3xl font-bold ${analytics.atRiskStudents?.length > 0 ? 'text-red-500' : 'text-green-500'}`}>
+                {analytics.atRiskStudents?.length || 0}
+              </p>
+              <p className="text-sm text-gray-600">At-Risk Students</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="p-4 border border-red-200 rounded-lg bg-red-50">
+              <h4 className="font-semibold text-red-700 mb-2">At-Risk Students ({analytics.atRiskStudents?.length || 0})</h4>
+              <ul className="text-sm space-y-1 text-red-600">
+                {analytics.atRiskStudents?.length > 0 ? (
+                  analytics.atRiskStudents.map(s => (
+                    <li key={s.id} className="truncate">
+                      {s.name} ({s.groupId}) - Req: {s.requiredPaceValue} {s.requiredPaceUnit.split(' ')[0]}
+                    </li>
+                  ))
+                ) : (
+                  <li className="text-gray-500">All students on target!</li>
+                )}
+              </ul>
+            </div>
+            <div className="p-4 border border-green-200 rounded-lg bg-green-50">
+              <h4 className="font-semibold text-green-700 mb-2">Top Active Students (30 Days)</h4>
+              <ul className="text-sm space-y-1 text-green-600">
+                {analytics.topActiveStudents?.length > 0 ? (
+                  analytics.topActiveStudents.map((a, index) => (
+                    <li key={index}>
+                      {index + 1}. {a.student} ({a.count} logs)
+                    </li>
+                  ))
+                ) : (
+                  <li className="text-gray-500">No recent activity.</li>
+                )}
+              </ul>
+            </div>
+          </div>
+        </PanelCard>
+    </div>
+);
+
+// New component created to isolate student filter/search logic and prevent focus loss on re-render.
+// Removed setIsAddStudentModalOpen prop and the Add Student button.
+const StudentFilterPanel = React.memo(({
+    filterMode, setFilterMode, groupFilter, setGroupFilter, teacherFilter, setTeacherFilter,
+    searchTerm, setSearchTerm, teachers, filteredStudents, setActiveStudentId, activeStudentId,
+    getTeacherDisplayName
+}) => {
+    
+    // The list of group IDs for the filter buttons
+    const groupFilterOptions = useMemo(() => ['All', ...GROUP_NAMES.map(g => g.id)], []);
+    
+    return (
+        <PanelCard title="Student Filters">
+                        
+            {/* Filter Mode Toggle */}
+            <div className="flex mb-4 bg-gray-200 rounded-lg p-1">
+                <button
+                onClick={() => {
+                    setFilterMode('Group');
+                    setGroupFilter('All');
+                    setTeacherFilter('All');
+                }}
+                className={`w-1/2 p-2 text-sm font-semibold rounded-lg transition ${
+                    filterMode === 'Group'
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-gray-700 hover:bg-gray-300'
+                }`}
+                >
+                By Group
+                </button>
+                <button
+                onClick={() => {
+                    setFilterMode('Teacher');
+                    setTeacherFilter('All');
+                    setGroupFilter('All');
+                }}
+                className={`w-1/2 p-2 text-sm font-semibold rounded-lg transition ${
+                    filterMode === 'Teacher'
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-gray-700 hover:bg-gray-300'
+                }`}
+                >
+                By Teacher
+                </button>
+            </div>
+
+            {/* Dynamic Filter Buttons */}
+            <div className="flex flex-wrap gap-2 mb-4 justify-center max-h-40 overflow-y-auto">
+                {filterMode === 'Group' ? (
+                groupFilterOptions.map(id => (
+                    <button
+                    key={id}
+                    onClick={() => setGroupFilter(id)}
+                    className={`px-3 py-1 text-xs font-semibold rounded-full transition ${
+                        id === groupFilter
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                    }`}
+                    >
+                    {id === 'All' ? 'All Groups' : id}
+                    </button>
+                ))
+                ) : (
+                ['All', ...teachers].map(teacher => {
+                    const id = teacher === 'All' ? 'All' : teacher.id;
+                    const name = teacher === 'All' ? 'All Teachers' : teacher.name;
+                    return (
+                    <button
+                        key={id}
+                        onClick={() => setTeacherFilter(id)}
+                        className={`px-3 py-1 text-xs font-semibold rounded-full transition truncate max-w-full ${
+                        id === teacherFilter
+                            ? 'bg-indigo-600 text-white shadow-md'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                        title={name}
+                    >
+                        {name}
+                    </button>
+                    );
+                })
+                )}
+            </div>
+
+            {/* Search Input (Fixed Focus Loss by ensuring input is always controlled and stable) */}
+            <input
+                type="text"
+                placeholder="Search student or teacher name..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full p-2 border border-gray-300 rounded-lg mb-4 text-sm focus:ring-indigo-500 focus:border-indigo-500"
+            />
+            
+            {/* REMOVED: Enroll New Student button from here, it's now in the SideNav */}
+
+            <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
+                {filteredStudents.length === 0 ? (
+                <p className="text-gray-500 text-sm">No students found matching current filter.</p>
+                ) : (
+                filteredStudents.map((student) => {
+                    const teacherDisplay = getTeacherDisplayName(student.teacherName);
+                    return (
+                        <div
+                            key={student.id}
+                            onClick={() => setActiveStudentId(student.id)}
+                            className={`p-3 rounded-lg cursor-pointer transition duration-150 ease-in-out ${
+                            student.id === activeStudentId
+                                ? 'bg-indigo-600 text-white shadow-md'
+                                : 'bg-gray-100 hover:bg-indigo-50 border border-gray-200'
+                            }`}
+                        >
+                            <p className="font-semibold truncate">{student.name}</p>
+                            <div className={`flex justify-between text-sm ${student.id === activeStudentId ? 'text-indigo-200' : 'text-gray-500'}`}>
+                                <span className="font-medium text-xs px-2 py-0.5 rounded bg-gray-300 text-gray-800">
+                                    {student.groupId}
+                                </span>
+                                <span className='ml-2 truncate text-xs' title={`Assigned Teacher: ${teacherDisplay}`}>{teacherDisplay}</span>
+                                <span>Lesson: {student.currentUnitNumber || 0}</span>
+                            </div>
+                        </div>
+                    );
+                })
+                )}
+            </div>
+        </PanelCard>
+    );
+});
+
+// --- 6. CORE LAYOUT AND PANELS ---
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-sans text-gray-800">
+      <header className="bg-indigo-700 text-white shadow-lg p-4 flex justify-between items-center">
+        <div>
+            <h1 className="text-2xl font-extrabold tracking-tight">Qaida Tracker</h1>
+            <p className="text-indigo-200 text-sm">{viewMode === 'tracker' ? 'Student Progress View' : 'Global Dashboard'}</p>
+        </div>
+        
+        {/* HAMBURGER MENU BUTTON (Mobile) */}
+        <button 
+            onClick={() => setIsNavOpen(true)}
+            className="p-2 rounded-full hover:bg-indigo-600 transition" 
+            title="Menu"
+        >
+            {/* Hamburger Icon (3 bars) */}
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+        </button>
+        
+        {/* Desktop/Tablet Navigation (Always visible) */}
+        <nav className="hidden lg:flex space-x-4">
+            <button
+                onClick={() => setViewMode('tracker')}
+                className={`font-semibold p-2 rounded-lg transition ${viewMode === 'tracker' ? 'bg-indigo-600 text-white' : 'text-indigo-200 hover:text-white hover:bg-indigo-600'}`}
+            >
+                Student Tracker
+            </button>
+            <button
+                onClick={() => setViewMode('dashboard')}
+                className={`font-semibold p-2 rounded-lg transition ${viewMode === 'dashboard' ? 'bg-indigo-600 text-white' : 'text-indigo-200 hover:text-white hover:bg-indigo-600'}`}
+            >
+                Global Dashboard
+            </button>
+        </nav>
+      </header>
+
+      {/* Side Navigation Menu (Mobile) - UPDATED PROPS */}
+      <SideNav 
+          isOpen={isNavOpen} 
+          closeNav={() => setIsNavOpen(false)} 
+          setViewMode={setViewMode}
+          currentViewMode={viewMode}
+          userId={userId}
+          openManageTeachersModal={() => {
+            setIsManageTeachersModalOpen(true);
+            setIsNavOpen(false); // Close the nav when opening the modal
+          }}
+          // NEW PROP PASSED
+          openAddStudentModal={() => {
+            setIsAddStudentModalOpen(true);
+            setIsNavOpen(false); // Close the nav when opening the modal
+          }}
+          setFilterMode={setFilterMode}
+          setGroupFilter={setGroupFilter}
+      />
+
+
+      {/* Main Content Grid */}
+      <main className="p-4 sm:p-6 lg:p-8">
+        
+        {/* Conditional Rendering for Dashboard View */}
+        {viewMode === 'dashboard' && (
+            <div className="grid grid-cols-1 gap-6">
+                {renderGlobalDashboard()}
+            </div>
+        )}
+
+        {/* Conditional Rendering for Student Tracker View */}
+        {viewMode === 'tracker' && (
+            <div className="grid grid-cols-1 lg:grid-cols-4 xl:grid-cols-5 gap-6">
+
+                {/* A. Student List Panel (Left/Top) - Now using memoized component */}
+                <div className="lg:col-span-1 xl:col-span-1">
+                    <StudentFilterPanel
+                        filterMode={filterMode} 
+                        setFilterMode={setFilterMode} 
+                        groupFilter={groupFilter} 
+                        setGroupFilter={setGroupFilter} 
+                        teacherFilter={teacherFilter} 
+                        setTeacherFilter={setTeacherFilter}
+                        searchTerm={searchTerm} 
+                        setSearchTerm={setSearchTerm} 
+                        teachers={teachers} 
+                        filteredStudents={filteredStudents} 
+                        setActiveStudentId={setActiveStudentId} 
+                        activeStudentId={activeStudentId}
+                        getTeacherDisplayName={getTeacherDisplayName}
+                    />
+                </div>
+
+                {/* B. Student Dashboard & Analytics (Center) */}
+                <div className="lg:col-span-2 xl:col-span-3">
+
+                    {/* Student Dashboard */}
+                    <PanelCard title={activeStudent ? `${activeStudent.name}'s Dashboard` : 'Select a Student'} className="mt-0">
+                        {activeStudent && activeStudentGroupConfig ? (
+                            <>
+                                {/* Teacher & Group Info */}
+                                <div className="flex flex-wrap gap-3 mb-4">
+                                    <span className="text-sm font-bold px-3 py-1 rounded-full bg-indigo-100 text-indigo-700">
+                                        Group ID: {activeStudent.groupId}
+                                    </span>
+                                    <span className="text-sm font-bold px-3 py-1 rounded-full bg-gray-200 text-gray-700">
+                                        Group: {activeStudentGroupConfig.name}
+                                    </span>
+                                    <span 
+                                        className="text-sm font-bold px-3 py-1 rounded-full bg-indigo-500 text-white shadow-md truncate max-w-full"
+                                        title={`Teacher ID: ${activeStudent.teacherName}`}
+                                    >
+                                        Teacher: {getTeacherDisplayName(activeStudent.teacherName)}
+                                    </span>
+                                </div>
+
+                                {/* Goal & Pacing */}
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6 text-center">
+                                    {/* Current Progress */}
+                                    <div className="p-4 bg-gray-100 rounded-lg shadow-sm border-l-4 border-indigo-500">
+                                        <p className="text-sm text-gray-500">Current Progress</p>
+                                        <p className="text-2xl font-bold text-indigo-700">
+                                            {activeStudent.currentUnitNumber || 0} <span className="text-lg text-gray-500">of {activeStudentGroupConfig.targetLesson} Lessons</span>
+                                        </p>
+                                    </div>
+
+                                    {/* Target Date */}
+                                    <div className="p-4 bg-gray-100 rounded-lg shadow-sm border-l-4 border-indigo-500">
+                                        <p className="text-sm text-gray-500">Target Date</p>
+                                        <p className="text-2xl font-bold text-indigo-700">
+                                            {formatDate(activeStudent.goalTargetDate)}
+                                        </p>
+                                    </div>
+
+                                    {/* Calculated Pace */}
+                                    <div className="p-4 bg-indigo-600 text-white rounded-lg shadow-xl">
+                                        <p className="text-sm text-indigo-200">Required Pace</p>
+                                        <p className="text-2xl font-bold">
+                                            {calculatePace(activeStudent.currentUnitNumber, activeStudentGroupConfig.targetLesson, activeStudent.goalTargetDate).pace}
+                                            <span className="text-lg font-normal"> {calculatePace(activeStudent.currentUnitNumber, activeStudentGroupConfig.targetLesson, activeStudent.goalTargetDate).unit}</span>
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {/* Lesson History Timeline */}
+                                <h3 className="text-xl font-semibold mt-6 mb-3 border-b pb-2">Lesson History Timeline</h3>
+                                <div className="max-h-80 overflow-y-auto space-y-4 pr-2">
+                                    {logs
+                                        .filter(log => log.studentId === activeStudent.id)
+                                        .sort((a, b) => b.date.toDate() - a.date.toDate()) // Sort descending by date
+                                        .map((log) => {
+                                            const isReview = log.logType === 'Review';
+                                            const badgeText = log.logType || 'Pass';
+                                            const badgeBg = isReview ? 'bg-yellow-500 text-yellow-900' : 'bg-green-500 text-white';
+                                            const cardBg = isReview ? 'bg-yellow-50 border-yellow-300' : 'bg-gray-50 border-gray-200';
+                                            const unitBg = isReview ? 'bg-yellow-500 text-yellow-900' : 'bg-indigo-500 text-white';
+                                            
+                                            // Display the ID of the logger (the logged-in user who made the entry)
+                                            const loggerDisplay = log.loggedByUserId ? `Logger ID: ${log.loggedByUserId.substring(0, 8)}...` : 'Unknown Logger';
+
+                                            return (
+                                                <div 
+                                                    key={log.id} 
+                                                    className={`flex items-start space-x-3 p-3 rounded-lg border shadow-sm ${cardBg}`}
+                                                >
+                                                    <div className={`flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-full font-bold ${unitBg}`}>
+                                                        L{log.lessonNumber}
+                                                    </div>
+                                                    <div className="flex-grow">
+                                                        <div className="flex justify-between items-center">
+                                                            <p className="text-sm font-medium text-gray-600">{formatDate(log.date)}</p>
+                                                            <span className="text-xs text-gray-500 italic" title={loggerDisplay}>{loggerDisplay}</span>
+                                                        </div>
+                                                        <p className="font-semibold">
+                                                            {log.progressDetail}
+                                                            <span className={`ml-2 text-xs font-bold px-2 py-0.5 rounded-full ${badgeBg}`}>
+                                                                {badgeText}
+                                                            </span>
+                                                        </p>
+                                                        {log.teacherNotes && <p className="text-xs text-gray-500 italic mt-1">Note: {log.teacherNotes}</p>}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    {logs.filter(log => log.studentId === activeStudent.id).length === 0 && (
+                                        <p className="text-gray-500 text-center py-4">No progress logs recorded yet.</p>
+                                    )}
+                                </div>
+                            </>
+                        ) : (
+                            <p className="text-center text-gray-500 py-10">Select a student from the list to view their progress.</p>
+                        )}
+                    </PanelCard>
+                </div>
+
+                {/* C. Log/Action Panel (Right) */}
+                <div className="lg:col-span-1 xl:col-span-1">
+
+                    {activeStudent && activeStudentGroupConfig ? (
+                        <>
+                            {/* Daily Progress Form */}
+                            <DailyProgressForm
+                                activeStudent={activeStudent}
+                                handleLogProgress={handleLogProgress}
+                                totalLessons={TOTAL_LESSONS}
+                            />
+
+                            {/* Goal Setting Action */}
+                            <PanelCard title="Goal Management">
+                                <p className="text-sm text-gray-600 mb-3">Goal: Complete Lesson {activeStudentGroupConfig.targetLesson}</p>
+                                <button
+                                    onClick={() => setIsSetGoalModalOpen(true)}
+                                    className="w-full px-4 py-2 mb-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition"
+                                >
+                                    Set/Edit Group Goal Date
+                                </button>
+                                <button
+                                    onClick={() => setIsReassignModalOpen(true)}
+                                    className="w-full px-4 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition"
+                                >
+                                    Reassign Teacher
+                                </button>
+                            </PanelCard>
+                        </>
+                    ) : (
+                        <PanelCard title="Actions" className="h-48 flex items-center justify-center">
+                            <p className="text-center text-gray-500">Select a student to log progress or set goals.</p>
+                        </PanelCard>
+                    )}
+                </div>
+            </div>
+        )}
+      </main>
+
+      {isManageTeachersModalOpen && <ManageTeachersModal />}
+      {isAddStudentModalOpen && <AddStudentModal />}
+      {activeStudent && activeStudentGroupConfig && isSetGoalModalOpen && <SetGoalModal />}
+      {activeStudent && isReassignModalOpen && <ReassignTeacherModal />} 
+    </div>
+  );
+};
+
+export default App;
+
